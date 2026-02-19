@@ -1,0 +1,618 @@
+---
+title: "APOEanalyses_6Jan25_RP"
+output: html_document
+date: "2026-01-06"
+---
+
+```{r, setup, include=FALSE}
+rm(list=ls())
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(HardyWeinberg)
+library(pscl)
+library(scales)
+library(Cairo)
+library(interactions)
+library(RColorBrewer)
+library(Matrix)
+library(GMMAT)
+library(nhanesA)
+```
+
+### Read in data and clean up
+
+```{r}
+apoe_oa <- read.delim("./github/apoe_OA_github.txt",header = T,sep = "\t")
+apoe_turkana <- read.delim("./github/apoe_turkana_github.txt",header = T,sep = "\t")
+
+#update urbanicity score
+apoe_oa$urb_score_old <- apoe_oa$urb_score
+apoe_oa$urb_score <- NULL
+urbs <- read.delim("OAHeLP_location_urbanicity_scores_2026-02-15.txt")
+urbs <- urbs[which(complete.cases(urbs$urb_score)),c("village_id","urb_score")]
+apoe_oa <- left_join(apoe_oa, urbs, by = c("interview_location_med" = "village_id"))
+plot(apoe_oa$urb_score, apoe_oa$urb_score_old)
+rm(urbs)
+
+# lifestyle category 
+hist(apoe_turkana$urb_score,30)
+hist(apoe_oa$urb_score,30)
+apoe_turkana <- apoe_turkana %>% 
+  mutate(lifestyle = case_when(urb_score > 25 ~ "urban", .default = "rural"))
+apoe_oa <- apoe_oa %>% 
+  mutate(lifestyle = case_when(urb_score > 25 ~ "urban", .default = "rural"))
+
+# Tidy genotypes
+apoe_turkana <- apoe_turkana %>% 
+  mutate(rs429358_geno = case_when(rs429358 == "C/T"~1,
+                                   rs429358 == "C/C"~2,
+                                   .default = 0), 
+         rs7412_geno = case_when(rs7412 == "C/T"~1,
+                                 rs7412 == "T/T"~2,
+                                 .default = 0))
+
+apoe_oa <- apoe_oa %>% 
+  mutate(rs429358_geno = case_when(rs429358 == "C/T"~1,
+                                   rs429358 == "C/C"~2,
+                                   .default = 0), 
+         rs7412_geno = case_when(rs7412 == "C/T"~1,
+                                 rs7412 == "T/T"~2,
+                                 .default = 0))
+
+# Make character 
+apoe_oa <- apoe_oa %>% mutate(APOE_Genotype = as.character(APOE_Genotype))
+apoe_turkana <- apoe_turkana %>% mutate(APOE_Genotype = as.character(APOE_Genotype))
+
+#OA data cleaning
+#remove instances where menopause earlier than 40 or later than 62
+to_remove_age<-subset(apoe_oa, (menopause_yn == 0 & age > 62) | (menopause_yn == 1 & age < 40), select = tid)[,1]
+apoe_oa <- apoe_oa %>% mutate(menopause_yn=ifelse(tid %in% to_remove_age, NA, menopause_yn))
+
+#change menopause to no if they are pregnant, breastfeeding, or cycling
+change_ids<-c("96", "244", "JJJWP", "346", "FQ9N3", "CKLK3", "KW4P2", "LHAFX", "M4PHV", "XNH7C")
+apoe_oa <- apoe_oa %>% mutate(menopause_yn=ifelse(rid %in% change_ids, 0, menopause_yn))
+
+#subset to women who have to had first child by age 30 
+apoe_oa<-subset(apoe_oa, (number_births_corrected>0 | age<30) & sex == "female")
+
+
+#Turkana data cleaning
+#remove instances with too many births compared to fertile years
+# 2924_1_2022-03-31: 7 births in 5 years
+# 2531_12_2021-09-28: 15 births in 28 years (birth every 1.87 years)
+# 2641_13_2021-10-01: 13 births in 22 years (birth every 1.7 years)
+# 2745_20_2022-03-30: 5 pregnancies but 8 live births
+
+change_to_NA<-c("2924_1_2022-03-31", "2531_12_2021-09-28", "2641_13_2021-10-01", "2745_20_2022-03-30")
+cols_to_change<-c("number_of_live_births", "number_of_pregnancies", "number_of_children")
+apoe_turkana[apoe_turkana$SampleID %in% change_to_NA, cols_to_change] <- NA
+
+#what range of age at menarche is observed in nhanes?
+datasets<-nhanesSearch("menstrual")
+rhq <- nhanes("RHQ")
+sub<-subset(rhq, RHQ010 < 100 & RHQ010 > 0)
+min(sub$RHQ010, na.rm=T) #earliest 8 years old
+max(sub$RHQ010, na.rm=T) #latest 20 years old
+
+#remove instances of menarche before 8 or after 20
+apoe_turkana$age_of_first_menstrual_period[which(apoe_turkana$age_of_first_menstrual_period > 20 | apoe_turkana$age_of_first_menstrual_period < 8)]<-NA  #removes 7
+
+#remove instances of first child after 30
+apoe_turkana$how_old_were_you_when_your_first_child_was_born[which(apoe_turkana$how_old_were_you_when_your_first_child_was_born > 30)]<-NA
+
+#subset to women who have to had first child by age 30 
+apoe_turkana<-subset(apoe_turkana, (number_of_live_births>0 | age<30) & sex == "female")
+```
+
+#plot colors
+```{r}
+colors <- RColorBrewer::brewer.pal(n = 9, name = "Paired")
+light_oa <- "#FFB6C1"
+main_oa <- colors[6]
+dark_oa <- "#99322F"
+light_turkana <- colors[1]
+main_turkana <- colors[2]
+dark_turkana<- "#3A6992"
+```
+
+
+########## APOE effects on fertility in the Orang Asli ##########
+
+##### Age adjusted fertility #####
+
+```{r}
+All_OA_results<-as.data.frame(matrix(NA, nrow=0, ncol=13))
+colnames(All_OA_results)<-c("n", "Beta1", "Beta2", "Beta3", "Beta4", "SE1", "SE2", "SE3", "SE4", "p1", "p2", "p3", "p4")
+```
+
+```{r}
+# Full model all data
+ageadjust_oa_mod<- glm(number_births_corrected ~ scale(1/age) + (APOE_linear)*scale(urb_score) , family='poisson',apoe_oa)
+ageadjust_oa<-summary(ageadjust_oa_mod)$coefficients
+
+All_OA_results["Age-adjusted",]<-c(nobs(ageadjust_oa_mod), ageadjust_oa[2:5,1], ageadjust_oa[2:5,2], ageadjust_oa[2:5,4])
+
+### Restricted model with no birth control:
+apoe_oa_f_nobc<-subset(apoe_oa, birth_control != 1 | is.na(birth_control))
+
+ageadjust_oa_nobc_mod<- glm(number_births_corrected ~ scale(1/age) + (APOE_linear)*scale(urb_score) , family='poisson',apoe_oa_f_nobc)
+ageadjust_oa_nobc<-summary(ageadjust_oa_nobc_mod)$coefficients
+
+All_OA_results["Age-adjusted (no bc)",]<-c(nobs(ageadjust_oa_nobc_mod), ageadjust_oa_nobc[2:5,1], ageadjust_oa_nobc[2:5,2], ageadjust_oa_nobc[2:5,4])
+```
+
+```{r}
+#Figure 6D
+apoe_oa_f_plotdata<- apoe_oa %>%
+  mutate(APOE2v4= ifelse(APOE_linear == 1 | APOE_linear == 2, "1/2", ifelse(APOE_linear == -1 | APOE_linear == -2, "-2/-1", "0")))
+apoe_oa_f_plotdata$APOE2v4 <- factor(apoe_oa_f_plotdata$APOE2v4, 
+                      levels = c("-2/-1", "0", "1/2"))
+
+OA_APOE_allfertility<- apoe_oa_f_plotdata %>%
+  filter(!is.na(age))  %>%
+  ggplot(aes(x = age,
+             y = as.numeric(number_births_corrected),
+             color = APOE2v4)) +
+  geom_point(alpha = 0.5, position = position_jitter(width = 0.5, height = 0)) +
+  geom_smooth(method = "lm",
+              formula = y ~ +I(1/x), se = TRUE, size = 1.2,alpha = 0.2) +
+  labs(x = "Age", y = "Number of births", color = "") +
+  theme_classic(base_size = 16) +theme(legend.position = "right")+
+  scale_color_manual(values=c(light_oa, main_oa, dark_oa))+ylim(0,15) + xlim(12,81);OA_APOE_allfertility
+
+ggsave("OA_APOE_allfertility_lineplot.pdf", OA_APOE_allfertility, width=8, height=4, device=cairo_pdf)
+```
+
+
+##### Completed fertility #####
+
+```{r}
+apoe_oa_complete<-subset(apoe_oa, age>45)
+
+complete_oa_mod<-glm(number_births_corrected ~ (APOE_linear)*scale(urb_score), family='poisson',apoe_oa_complete)
+complete_oa<-summary(complete_oa_mod)$coefficients
+
+All_OA_results["Complete",]<-c(nobs(complete_oa_mod), NA, complete_oa[2:4,1], NA, complete_oa[2:4,2], NA, complete_oa[2:4,4])
+```
+
+
+```{r}
+#Figure 6D inset
+apoe_oa_plotdata<- apoe_oa %>%
+  mutate(APOE2v4= ifelse(APOE_linear == 1 | APOE_linear == 2, "1/2", ifelse(APOE_linear == -1 | APOE_linear == -2, "-2/-1", "0")))
+apoe_oa_plotdata$APOE2v4 <- factor(apoe_oa_plotdata$APOE2v4, 
+                      levels = c("-2/-1", "0", "1/2"))
+
+OA_completedfert_E4<-apoe_oa_plotdata %>%
+  filter(sex == "female" & age > 45 & number_births_corrected > 0) %>%
+  filter(!is.na(age))  %>%
+  ggplot(aes(x = APOE2v4,
+             y = as.numeric(number_births_corrected),
+             color = APOE2v4)) +
+  geom_violin() +
+  geom_point(alpha = 0.5, position = position_jitter(width = 0.3, height = 0), size=1) +
+  labs(
+    x = "",
+    y = "Number of births",
+    color = "APOE ε4 carrier"
+  ) +
+  theme_classic(base_size = 14) +theme(legend.position = "none")+
+  scale_color_manual(values=c(light_oa, main_oa, dark_oa))+ylim(0,15); OA_completedfert_E4
+
+ggsave("OA_completedfert_E4.pdf", OA_completedfert_E4, width=2, height=2, device=cairo_pdf)
+```
+
+## Completed fertility at different age cutoffs
+```{r}
+#Figure S6
+ages<-c(40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50)
+OA_completedfert_modelresults <- as.data.frame(matrix(NA, nrow=length(ages), ncol=11))
+colnames(OA_completedfert_modelresults)<-c("est", "conf.low", "conf.high", "pvalue", "age", "n")
+rownames(OA_completedfert_modelresults)<-ages
+for (i in ages){
+  
+
+coef<-summary(glm(number_births_corrected ~ (APOE_linear) * scale(urb_score) , family='poisson',
+           na.omit(apoe_oa[which(apoe_oa$age > i),
+                           c("number_births_corrected", "age", "APOE_linear", "urb_score")])))$coefficients 
+confint<-confint(glm(number_births_corrected ~ (APOE_linear)*scale(urb_score) , family='poisson',
+           na.omit(apoe_oa[which(apoe_oa$age > i ),
+                           c("number_births_corrected", "age", "APOE_linear", "urb_score")])))
+
+
+OA_completedfert_modelresults[paste(i),"est"]<-coef[2,1]
+OA_completedfert_modelresults[paste(i),"pvalue"]<-coef[2,4]
+OA_completedfert_modelresults[paste(i),"conf.low"]<-confint[2,1]
+OA_completedfert_modelresults[paste(i),"conf.high"]<-confint[2,2]
+OA_completedfert_modelresults[paste(i),"age"]<-i
+
+OA_completedfert_modelresults[paste(i),"n"] <- nrow(na.omit(apoe_oa[which(apoe_oa$sex == "female" & 
+                                   apoe_oa$age > i &
+                             apoe_oa$number_births_corrected > 0),c("number_births_corrected", "age", "APOE_linear", "urb_score")]))
+}
+
+OA_completedfert_modelresults$sig<-ifelse(OA_completedfert_modelresults$pvalue < 0.05, "Yes", "No")
+
+completed_fertility_age_plot<-ggplot(data=OA_completedfert_modelresults, aes(y=age, x=est, color=sig)) +
+  geom_point() +
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high)) +
+  scale_color_manual(name="significant", values=c(light_oa, main_oa)) +
+  theme_classic(base_size = 16) +theme(legend.position = "none", plot.title=element_text(hjust=0.5)) +
+  geom_vline(xintercept=0, linetype="dashed") +
+  geom_text(aes(y=age, x=conf.high + 0.06, label=paste0("n=",n, "; p=", round(pvalue,2))), color="black", size=4) +
+  scale_y_continuous(breaks = c(40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50)) +
+  xlim(-0.15, 0.25) +
+  xlab("Estimate") +
+  ylab("Age cutoff for completed fertility");completed_fertility_age_plot
+
+ggsave("completed_fertility_age_OA.pdf", completed_fertility_age_plot, width=5.5, height=5)
+```
+
+
+## Age at menopause
+
+```{r}
+menopause_oa_mod <- glm(menopause_yn ~ scale(1/age) + APOE_linear*scale(urb_score),
+             family = binomial(link = "logit"),apoe_oa)
+menopause_oa<-summary(menopause_oa_mod)$coefficients
+
+All_OA_results["Menopause",]<-c(nobs(menopause_oa_mod), menopause_oa[2:5,1], menopause_oa[2:5,2], menopause_oa[2:5,4])
+```
+
+
+```{r}
+#Figure 6C
+APOElin_model <- glm(menopause_yn ~ scale(1/age) + APOE_linear*lifestyle,
+             family = binomial(link = "logit"),
+             data = na.omit(apoe_oa[which(apoe_oa$sex == "female"),
+                           c("menopause_yn", "age", "APOE_linear", "lifestyle")]));summary(APOElin_model)
+
+menopause_APOE<-interact_plot(APOElin_model, pred=APOE_linear, modx=lifestyle, plot.points=F, interval=T, at = list(age = 50), colors=c(main_oa, light_oa)) +
+  theme_classic(16) +
+  theme(legend.position = "none") +
+  scale_linetype_manual(values = rep("solid", 2)) +   
+  scale_fill_manual(name="Lifestyle", values = rep("grey70", 2)) +
+  scale_color_manual(name="Lifestyle", values=c(main_oa, light_oa)) +
+  guides(linetype = "none") +
+  ylab("Probability of menopause \nat age 50") +
+  xlab("Genotype");menopause_APOE
+
+ggsave("menopause_APOE.pdf", menopause_APOE, width=4, height=4)
+```
+
+### Save all OA results
+```{r}
+write.table(All_OA_results, "6Jan26_APOE_OA_fertility_results.txt", quote=F, row.names=T, sep="\t", col.names=T)
+```
+
+
+
+########## APOE effects on fertility in the Turkana ##########
+
+```{r}
+All_turkana_results<-as.data.frame(matrix(NA, nrow=0, ncol=13))
+colnames(All_turkana_results)<-c("n", "Beta1", "Beta2", "Beta3", "Beta4", "SE1", "SE2", "SE3", "SE4", "p1", "p2", "p3", "p4")
+```
+
+##### Age-adjusted fertility #####
+```{r}
+## All ages dataset
+ageadjust_turk_mod<-glm(number_of_live_births ~ scale(1/age) + (APOE_linear)*scale(urb_score) , family='poisson',apoe_turkana)                    
+ageadjust_turk<-summary(ageadjust_turk_mod)$coefficients
+
+All_turkana_results["Age-adjusted",]<-c(nobs(ageadjust_turk_mod), ageadjust_turk[2:5,1], ageadjust_turk[2:5,2], ageadjust_turk[2:5,4])
+
+### Restricted model with no birth control
+apoe_turk_nobc<-subset(apoe_turkana, !grepl("^Yes", currently_on_any_form_of_birth_control))
+ageadjust_nobc_turk_mod<- glm(number_of_live_births ~ scale(1/age) + (APOE_linear)*scale(urb_score),family='poisson',apoe_turk_nobc)
+ageadjust_nobc_turk<-summary(ageadjust_nobc_turk_mod)$coefficients
+
+All_turkana_results["Age-adjusted (no bc)",]<-c(nobs(ageadjust_nobc_turk_mod), ageadjust_nobc_turk[2:5,1], ageadjust_nobc_turk[2:5,2], ageadjust_nobc_turk[2:5,4])
+```
+
+```{r}
+#Figure 6E
+apoe_turk_f_plotdata<- apoe_turkana %>%
+  mutate(APOE2v4= ifelse(APOE_linear == 1 | APOE_linear == 2, "1/2", ifelse(APOE_linear == -1 | APOE_linear == -2, "-2/-1", "0")))
+apoe_turk_f_plotdata$APOE2v4 <- factor(apoe_turk_f_plotdata$APOE2v4, 
+                      levels = c("-2/-1", "0", "1/2"))
+
+
+Turk_APOE_allfertility<-apoe_turk_f_plotdata %>%
+  filter(age < 30 | number_of_live_births > 0) %>%
+  filter(!is.na(age))  %>%
+  ggplot(aes(x = age,
+             y = as.numeric(number_of_live_births),
+             color = APOE2v4)) +
+  geom_point(alpha = 0.5, position = position_jitter(width = 0.5, height = 0)) +
+  geom_smooth(method = "lm",
+              formula = y ~ +I(1/x), se = TRUE, size = 1.2,alpha = 0.2) +
+  labs(
+    x = "Age",
+    y = "Number of births",
+    color = ""
+  ) +
+  theme_classic(base_size = 16) +theme(legend.position = "right")+
+  ylim(0,16) + xlim(12,81) +
+  scale_color_manual(values=c(light_turkana, main_turkana, dark_turkana));Turk_APOE_allfertility
+
+ggsave("Turk_APOE_allfertility_lineplot.pdf", Turk_APOE_allfertility, width=8, height=4, device=cairo_pdf)
+```
+
+
+##### Completed fertility #####
+
+```{r}
+apoe_turk_complete<-subset(apoe_turkana, age > 45)
+
+complete_turk_mod<-glm(number_of_live_births ~  (APOE_linear)*scale(urb_score) , family='poisson',apoe_turk_complete)
+complete_turk<-summary(complete_turk_mod)$coefficients
+
+
+All_turkana_results["Complete",]<-c(nobs(complete_turk_mod), NA, complete_turk[2:4,1], NA, complete_turk[2:4,2], NA, complete_turk[2:4,4])
+```
+
+```{r}
+#Figure 6E inset
+apoe_turk_f_plotdata<- apoe_turkana %>%
+  mutate(APOE2v4= ifelse(APOE_linear == 1 | APOE_linear == 2, "1/2", ifelse(APOE_linear == -1 | APOE_linear == -2, "-2/-1", "0"))) 
+apoe_turk_f_plotdata$APOE2v4 <- factor(apoe_turk_f_plotdata$APOE2v4, 
+                      levels = c("-2/-1", "0", "1/2"))
+
+Turk_completedfert_E4<-apoe_turk_f_plotdata %>%
+  filter(sex == "female" & age > 45 & number_of_live_births > 0) %>%
+  filter(!is.na(age))  %>%
+  ggplot(aes(x = APOE2v4,
+             y = as.numeric(number_of_live_births),
+             color = APOE2v4)) +
+  geom_violin() +
+  geom_point(alpha = 0.5, position = position_jitter(width = 0.3, height = 0), size=1) +
+  labs(
+    x = "",
+    y = "Number of births",
+    color = ""
+  ) +
+  theme_classic(base_size = 14) +theme(legend.position = "none")+
+  scale_x_discrete(labels=c("ε2 carrier (-1,-2)"= "-2/-1", "neither/both (0)" = "0", "ε4 carrier (1,2)" = "1/2")) +
+  scale_color_manual(values=c(light_turkana, main_turkana, dark_turkana))+ylim(0,15); Turk_completedfert_E4
+
+ggsave("Turk_completedfert_E4.pdf", Turk_completedfert_E4, width=2, height=2, device=cairo_pdf)
+```
+
+#Completed fertility at different age cutoffs
+```{r}
+#Figure S6
+ages<-c(40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50)
+Turk_completedfert_modelresults <- as.data.frame(matrix(NA, nrow=length(ages), ncol=11))
+colnames(Turk_completedfert_modelresults)<-c("est", "conf.low", "conf.high", "pvalue", "age", "n")
+rownames(Turk_completedfert_modelresults)<-ages
+for (i in ages){
+  
+
+coef<-summary(glm(number_of_live_births ~ (APOE_linear) * scale(urb_score) , family='poisson',
+           na.omit(apoe_turkana[which(apoe_turkana$sex == "female" & 
+                                   apoe_turkana$age > i),
+                           c("number_of_live_births", "age", "APOE_linear", "urb_score")])))$coefficients 
+confint<-confint(glm(number_of_live_births ~ (APOE_linear)*scale(urb_score) , family='poisson',
+           na.omit(apoe_turkana[which(apoe_turkana$sex == "female" & 
+                                   apoe_turkana$age > i),
+                           c("number_of_live_births", "age", "APOE_linear", "urb_score")])))
+
+
+Turk_completedfert_modelresults[paste(i),"est"]<-coef[2,1]
+Turk_completedfert_modelresults[paste(i),"pvalue"]<-coef[2,4]
+Turk_completedfert_modelresults[paste(i),"conf.low"]<-confint[2,1]
+Turk_completedfert_modelresults[paste(i),"conf.high"]<-confint[2,2]
+Turk_completedfert_modelresults[paste(i),"age"]<-i
+
+Turk_completedfert_modelresults[paste(i),"n"] <- nrow(na.omit(apoe_turkana[which(
+                                   apoe_turkana$age > i), c("number_of_live_births", "age", "APOE_linear", "urb_score")]))
+}
+
+Turk_completedfert_modelresults$sig<-ifelse(Turk_completedfert_modelresults$pvalue < 0.05, "Yes", "No")
+
+completed_fertility_age_plot<-ggplot(data=Turk_completedfert_modelresults, aes(y=age, x=est, color=sig)) +
+  geom_point() +
+  geom_errorbar(aes(xmin=conf.low, xmax=conf.high)) +
+  scale_color_manual(name="significant", values=c(light_turkana, main_turkana)) +
+  theme_classic(base_size = 16) +theme(legend.position = "none") +
+  geom_vline(xintercept=0, linetype="dashed") +
+  geom_text(aes(y=age, x=conf.high + 0.05, label=paste0("n=",n, "; p=", round(pvalue,2))), color="black", size=4) +
+  scale_y_continuous(breaks = c(40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50)) +
+  xlim(-0.1, 0.2) +
+  xlab("Estimate") +
+  ylab("Age cutoff for completed fertility");completed_fertility_age_plot
+
+ggsave("completed_fertility_age_Turk.pdf", completed_fertility_age_plot, width=5.5, height=5)
+```
+
+
+##### Age at menarche #####
+```{r}
+menarche_turk_mod<- lm(scale(age_of_first_menstrual_period) ~ scale(age) + scale(APOE_linear)*scale(urb_score),data=apoe_turkana)
+menarche_turk<-summary(menarche_turk_mod)$coefficients
+
+All_turkana_results["Menarche",]<-c(nobs(menarche_turk_mod), menarche_turk[2:5,1], menarche_turk[2:5,2],  menarche_turk[2:5,4])
+```
+
+
+```{r}
+#Figure 6B
+menarche_APOE<- apoe_turkana %>% 
+  filter(!is.na(lifestyle)) %>%
+  mutate(APOE_linear = factor(APOE_linear)) %>% 
+  ggplot(aes(x = APOE_linear, y = age_of_first_menstrual_period)) + 
+  geom_violin(color=main_turkana) + 
+  geom_boxplot(width = 0.2, outlier.shape = NA, position = position_dodge(width = 0.9),color = main_turkana) +
+  theme_classic(16) +ylab('Age at menarche')+xlab('Genotype');menarche_APOE
+
+ggsave("menarche_APOE.pdf", menarche_APOE, width=4, height=4)
+```
+
+
+##### Age at first birth #####
+
+```{r}
+firstbirth_turk_mod<- lm(scale(how_old_were_you_when_your_first_child_was_born) ~ scale(age) + scale(APOE_linear)*scale(urb_score), apoe_turkana)
+firstbirth_turk<- summary(firstbirth_turk_mod)$coefficients
+
+All_turkana_results["First birth",]<-c(nobs(firstbirth_turk_mod), firstbirth_turk[2:5,1], firstbirth_turk[2:5,2],  firstbirth_turk[2:5,4])
+```
+
+
+### Save all turkana results
+```{r}
+write.table(All_turkana_results, "6Jan26_APOE_turkana_fertility_results.txt", quote=F, row.names=T, sep="\t", col.names=T)
+```
+
+
+
+###### Fertility analyses in orang asli controlling for genetic relatedness #########
+
+##### Age adjusted fertility #####
+```{r}
+kinship_OA_results<-as.data.frame(matrix(NA, nrow=0, ncol=13))
+colnames(kinship_OA_results)<-c("n", "Beta1", "Beta2", "Beta3", "Beta4", "SE1", "SE2", "SE3", "SE4", "p1", "p2", "p3", "p4")
+```
+
+```{r}
+#upload kinship matrix
+kinmat<-readRDS("./github/kinmat_oa.rds")
+rownames(kinmat)<-gsub("^X", "", rownames(kinmat))
+colnames(kinmat)<-gsub("^X", "", colnames(kinmat))
+```
+
+```{r}
+# Full model all data
+apoe_oa_f_allage<-subset(apoe_oa, (number_births_corrected>0 | age<30) & sex == "female")
+
+# make sure kinship matrix is subset to the same individuals
+apoe_oa_f_allage_wkin<- subset(apoe_oa_f_allage, tid %in% rownames(kinmat) & !is.na(urb_score) & !is.na(number_births_corrected))
+ids<-as.character(apoe_oa_f_allage_wkin$tid)
+kinmat_sub <- kinmat[ids, ids]
+
+#make kinship matrix positive definite
+kinmat_sub[kinmat_sub < 0] <- 0
+kinmat_pd <- as.matrix(nearPD(kinmat_sub, corr = TRUE)$mat)
+
+model <- glmmkin(
+  number_births_corrected ~ scale(1/age) + APOE_linear * scale(urb_score),
+  data = apoe_oa_f_allage_wkin,
+  kins = kinmat_pd,
+  family = poisson(link="log"),
+  id = "tid"
+)
+betas <- model$coef[-1]  
+ses <- sqrt(diag(model$cov))[-1]
+zvals <- betas / ses
+pvals <- 2 * pnorm(-abs(zvals))
+
+
+kinship_OA_results["Age-adjusted",]<-c(length(model$residuals), betas, ses, pvals)
+```
+
+```{r}
+# Full model all data
+apoe_oa_f_allage_nobc<-subset(apoe_oa_f_allage, birth_control != 1 | is.na(birth_control))
+
+# make sure kinship matrix is subset to the same individuals
+apoe_oa_f_allage_nobc_wkin<- subset(apoe_oa_f_allage_nobc, tid %in% rownames(kinmat) & !is.na(urb_score) & !is.na(number_births_corrected))
+ids<-as.character(apoe_oa_f_allage_nobc_wkin$tid)
+kinmat_sub <- kinmat[ids, ids]
+
+#make kinship matrix positive definite
+kinmat_sub[kinmat_sub < 0] <- 0
+kinmat_pd <- as.matrix(nearPD(kinmat_sub, corr = TRUE)$mat)
+
+model <- glmmkin(
+  number_births_corrected ~ scale(1/age) + APOE_linear * scale(urb_score),
+  data = apoe_oa_f_allage_nobc_wkin,
+  kins = kinmat_pd,
+  family = poisson(link="log"),
+  id = "tid"
+)
+betas <- model$coef[-1]  
+ses <- sqrt(diag(model$cov))[-1]
+zvals <- betas / ses
+pvals <- 2 * pnorm(-abs(zvals))
+
+
+kinship_OA_results["Age-adjusted (no bc)",]<-c(length(model$residuals), betas, ses, pvals)
+```
+
+```{r}
+# Completed fertility
+apoe_oa_f_complete<-subset(apoe_oa, (number_births_corrected>0 & age>45) & sex == "female")
+
+# make sure kinship matrix is subset to the same individuals
+apoe_oa_f_complete_wkin<- subset(apoe_oa_f_complete, tid %in% rownames(kinmat) & !is.na(urb_score) & !is.na(number_births_corrected))
+ids<-as.character(apoe_oa_f_complete_wkin$tid)
+kinmat_sub <- kinmat[ids, ids]
+
+#make kinship matrix positive definite
+kinmat_sub[kinmat_sub < 0] <- 0
+kinmat_pd <- as.matrix(nearPD(kinmat_sub, corr = TRUE)$mat)
+
+model <- glmmkin(
+  number_births_corrected ~ APOE_linear * scale(urb_score),
+  data = apoe_oa_f_complete_wkin,
+  kins = kinmat_pd,
+  family = poisson(link="log"),
+  id = "tid"
+)
+betas <- model$coef[-1]  
+ses <- sqrt(diag(model$cov))[-1]
+zvals <- betas / ses
+pvals <- 2 * pnorm(-abs(zvals))
+
+
+kinship_OA_results["Complete",]<-c(length(model$residuals), NA, betas, NA, ses, NA, pvals)
+```
+
+#Age at menopause
+
+```{r}
+to_remove_age<-subset(apoe_oa, (menopause_yn == 0 & age > 62) | (menopause_yn == 1 & age < 40), select = tid)[,1]
+apoe_oa <- apoe_oa %>% mutate(menopause_yn=ifelse(tid %in% to_remove_age, NA, menopause_yn))
+
+#change to 0 if they said they were menopausal but they are pregnant, breastfeeding, or cycling
+change_ids<-c("96", "244", "JJJWP", "346", "FQ9N3", "CKLK3", "KW4P2", "LHAFX", "M4PHV", "XNH7C")
+apoe_oa <- apoe_oa %>% mutate(menopause_yn=ifelse(rid %in% change_ids, 0, menopause_yn))
+```
+
+```{r}
+# Menopause
+apoe_oa_f<-subset(apoe_oa, sex == "female")
+
+# make sure kinship matrix is subset to the same individuals
+apoe_oa_f_wkin<- subset(apoe_oa_f, tid %in% rownames(kinmat) & !is.na(urb_score) & !is.na(menopause_yn))
+ids<-as.character(apoe_oa_f_wkin$tid)
+kinmat_sub <- kinmat[ids, ids]
+
+#make kinship matrix positive definite
+kinmat_sub[kinmat_sub < 0] <- 0
+kinmat_pd <- as.matrix(nearPD(kinmat_sub, corr = TRUE)$mat)
+
+model <- glmmkin(
+  menopause_yn ~ scale(1/age) + APOE_linear * scale(urb_score),
+  data = apoe_oa_f_wkin,
+  kins = kinmat_pd,
+  family = binomial(link="logit"),
+  id = "tid"
+)
+betas <- model$coef[-1]  
+ses <- sqrt(diag(model$cov))[-1]
+zvals <- betas / ses
+pvals <- 2 * pnorm(-abs(zvals))
+
+
+kinship_OA_results["Menopause",]<-c(length(model$residuals), betas, ses, pvals)
+```
+
+#save output 
+```{r}
+write.table(kinship_OA_results, "6Jan26_APOE_OA_fertility_results_kincorrect.txt", quote=F, row.names=T, sep="\t", col.names=T)
+```
+
